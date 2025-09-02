@@ -1,0 +1,131 @@
+import os
+import tempfile
+from typing import Optional
+
+from langchain.text_splitter import CharacterTextSplitter
+from langchain.vectorstores import FAISS
+from langchain.embeddings.openai import OpenAIEmbeddings
+from langchain.chains import RetrievalQA
+from langchain.llms import OpenAI
+from pypdf import PdfReader
+
+import gradio as gr
+
+# Ensure OPENAI_API_KEY is set in environment
+if "OPENAI_API_KEY" not in os.environ:
+    print("WARNING: Set OPENAI_API_KEY environment variable before running.")
+# Create globals to hold the vectorstore and retriever
+VECTORSTORE: Optional[FAISS] = None
+RETRIEVER = None
+QA_CHAIN: Optional[RetrievalQA] = None
+
+# ---------- Helpers ----------
+def load_pdf_to_text(file_path: str) -> str:
+    reader = PdfReader(file_path)
+    text = ""
+    for page in reader.pages:
+        ptext = page.extract_text()
+        if ptext:
+            text += ptext + "\n"
+    return text
+
+def build_vectorstore_from_text(text: str):
+    global VECTORSTORE, RETRIEVER, QA_CHAIN
+    splitter = CharacterTextSplitter(chunk_size=1000, chunk_overlap=200)
+    chunks = splitter.split_text(text)
+    embeddings = OpenAIEmbeddings()
+    VECTORSTORE = FAISS.from_texts(chunks, embeddings)
+    RETRIEVER = VECTORSTORE.as_retriever(search_type="similarity", search_kwargs={"k": 4})
+    llm = OpenAI(temperature=0)
+    QA_CHAIN = RetrievalQA.from_chain_type(llm=llm, retriever=RETRIEVER, chain_type="stuff")
+    return len(chunks)
+
+# Concept explain & quiz using OpenAI LLM directly
+def explain_concept_text(concept: str) -> str:
+    if not concept or concept.strip()=="":
+        return "Please provide a concept to explain."
+    llm = OpenAI(temperature=0.2, max_tokens=400)
+    prompt = f"Explain the following educational concept clearly and concisely for a student (include simple examples if helpful):\n\nConcept: {concept}\n\nExplanation:"
+    return llm(prompt)
+
+def generate_quiz_text(concept: str) -> str:
+    if not concept or concept.strip()=="":
+        return "Please provide a concept for quiz generation."
+    llm = OpenAI(temperature=0.3, max_tokens=400)
+    prompt = (
+        f"Create a short quiz (4 questions) on the following concept for students. "
+        f"Provide each question followed by the correct answer and a one-line explanation.\n\nConcept: {concept}\n\nQuiz:"
+    )
+    return llm(prompt)
+
+# ---------- Gradio functions ----------
+def upload_pdf(file_obj):
+    """
+    file_obj is a tempfile-like object from Gradio.
+    We'll read it, extract text, build vectorstore, and return status.
+    """
+    if file_obj is None:
+        return "No file uploaded."
+    # Save to a temp path
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
+        tmp.write(file_obj.read())
+        tmp_path = tmp.name
+    text = load_pdf_to_text(tmp_path)
+    if not text.strip():
+        return "Uploaded PDF contained no extractable text."
+    n_chunks = build_vectorstore_from_text(text)
+    return f"PDF uploaded and indexed into {n_chunks} chunks — ready to ask questions!"
+
+def ask_pdf_question(question: str):
+    if QA_CHAIN is None:
+        return "Upload and index a PDF first (use the PDF Upload tab)."
+    if not question or question.strip()=="":
+        return "Please enter a question."
+    # run retrieval QA
+    answer = QA_CHAIN.run(question)
+    return answer
+
+def explain_concept_ui(concept: str):
+    return explain_concept_text(concept)
+
+def generate_quiz_ui(concept: str):
+    return generate_quiz_text(concept)
+
+# ---------- Gradio UI ----------
+title = "StudyMate — AI PDF Q&A & Concept Helper"
+description = "Upload a PDF (lecture notes / textbook) and ask questions about it. Also explain concepts and generate short quizzes."
+
+with gr.Blocks(title=title) as demo:
+    gr.Markdown(f"# {title}")
+    gr.Markdown(description)
+
+    with gr.Tab("PDF Q&A"):
+        with gr.Row():
+            pdf_file = gr.File(label="Upload PDF (lecture notes or textbook PDF)", file_types=[".pdf"])
+            upload_btn = gr.Button("Upload & Index PDF")
+        upload_status = gr.Textbox(label="Status", interactive=False)
+        upload_btn.click(fn=upload_pdf, inputs=pdf_file, outputs=upload_status)
+
+        gr.Markdown("*Ask questions about the uploaded PDF*")
+        question_input = gr.Textbox(label="Question about PDF")
+        ask_btn = gr.Button("Ask")
+        answer_output = gr.Textbox(label="Answer", interactive=False)
+        ask_btn.click(fn=ask_pdf_question, inputs=question_input, outputs=answer_output)
+
+    with gr.Tab("Explain Concept"):
+        conc_in = gr.Textbox(label="Enter concept (e.g., 'Normalization in DBMS')")
+        conc_out = gr.Textbox(label="Explanation", interactive=False)
+        exp_btn = gr.Button("Explain")
+        exp_btn.click(fn=explain_concept_ui, inputs=conc_in, outputs=conc_out)
+
+    with gr.Tab("Generate Quiz"):
+        quiz_in = gr.Textbox(label="Enter concept for quiz")
+        quiz_out = gr.Textbox(label="Quiz (questions + answers)", interactive=False)
+        quiz_btn = gr.Button("Generate Quiz")
+        quiz_btn.click(fn=generate_quiz_ui, inputs=quiz_in, outputs=quiz_out)
+
+    gr.Markdown("*Note:* Set your OPENAI_API_KEY environment variable before running. The app does not upload your PDF anywhere else; it builds an in-memory vector index.")
+
+# Launch
+if _name_ == "_main_":
+    demo.launch()
